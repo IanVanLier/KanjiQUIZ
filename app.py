@@ -300,6 +300,7 @@ quiz_html = """
         .alt { color: #666; }
         .user-match { background: rgba(255, 165, 0, 0.2); color: #ffa500 !important; border: 2px solid #ffa500; }
         .wrong { color: #cf6679; text-decoration: line-through; }
+        .loading-dot { color: #444; font-size: 12px; margin-top: 5px; }
     </style>
 </head>
 <body>
@@ -308,44 +309,126 @@ quiz_html = """
             <a href="/" style="color: #888; text-decoration: none;">← Home</a>
             <div style="font-weight: bold;">{{rank}}</div>
             <div style="font-size: 14px; color: #aaa; display: flex; gap: 15px;">
-                <span>New: <b id="sn">{{stats.unreviewed}}</b></span>
-                <span style="color: #03dac6">OK: <b id="so">{{stats.passed}}</b></span>
-                <span style="color: #cf6679">Fail: <b id="sf">{{stats.failed}}</b></span>
+                <span>New: <b id="sn">--</b></span>
+                <span style="color: #03dac6">OK: <b id="so">--</b></span>
+                <span style="color: #cf6679">Fail: <b id="sf">--</b></span>
             </div>
         </div>
         <div class="progress-container"><div class="progress-bar" id="pb"></div></div>
     </div>
-    <div class="kanji" id="kj">...</div>
+    <div class="kanji" id="kj">Loading...</div>
     <input type="text" id="ans" autocomplete="off" autofocus>
     <div id="fb" class="reading-list"></div>
+    <div id="ld" class="loading-dot"></div>
+
     <script>
-        let cur = {}; let isProc = false; const input = document.getElementById('ans'); wanakana.bind(input);
-        function upd(s) {
-            document.getElementById('sn').innerText = s.unreviewed; document.getElementById('so').innerText = s.passed; document.getElementById('sf').innerText = s.failed;
+        let currentWord = null;
+        let nextWordBuffer = null;
+        let isProcessing = false;
+        
+        const input = document.getElementById('ans');
+        wanakana.bind(input);
+
+        function updateStats(s) {
+            document.getElementById('sn').innerText = s.unreviewed;
+            document.getElementById('so').innerText = s.passed;
+            document.getElementById('sf').innerText = s.failed;
             document.getElementById('pb').style.width = ((s.passed + s.failed) / s.total * 100) + "%";
         }
-        async function next() {
-            const res = await fetch(`/api/get_word/{{rank}}/{{mode}}`);
-            if(!res.ok) { document.getElementById('kj').innerText = "Finished!"; input.style.display="none"; return; }
-            cur = await res.json(); document.getElementById('kj').innerText = cur.kanji;
-            input.value = ''; document.getElementById('fb').innerHTML = ''; isProc = false;
+
+        // PRELOADER: Fetches the next word in the background
+        async function preloadNext() {
+            try {
+                const res = await fetch(`/api/get_word/{{rank}}/{{mode}}`);
+                if (res.ok) {
+                    nextWordBuffer = await res.json();
+                    document.getElementById('ld').innerText = ""; 
+                } else {
+                    nextWordBuffer = "FINISHED";
+                }
+            } catch (e) {
+                console.error("Preload failed", e);
+            }
         }
+
+        async function cycleWord() {
+            // If buffer is empty (first run), wait for it
+            if (!nextWordBuffer) {
+                document.getElementById('ld').innerText = "fetching...";
+                await preloadNext();
+            }
+
+            if (nextWordBuffer === "FINISHED") {
+                document.getElementById('kj').innerText = "Finished!";
+                input.style.display = "none";
+                return;
+            }
+
+            // Move buffer to current
+            currentWord = nextWordBuffer;
+            nextWordBuffer = null;
+            
+            // Render
+            document.getElementById('kj').innerText = currentWord.kanji;
+            input.value = '';
+            document.getElementById('fb').innerHTML = '';
+            isProcessing = false;
+            
+            // Immediately start preloading the NEXT one while user is thinking
+            preloadNext();
+        }
+
         input.addEventListener('keypress', async (e) => {
-            if(e.key === 'Enter') {
+            if (e.key === 'Enter') {
                 const val = input.value.trim();
-                if(val === "" || isProc) return;
-                isProc = true;
-                const isH = val === cur.bank_reading; const isS = cur.alt_readings.includes(val);
-                const ok = isH || isS; navigator.clipboard.writeText(cur.kanji);
-                const fb = document.getElementById('fb'); fb.innerHTML = '';
-                const bEl = document.createElement('div'); bEl.className = 'reading-item primary' + (isH ? ' user-match' : ''); bEl.innerText = cur.bank_reading; fb.appendChild(bEl);
-                cur.alt_readings.forEach(a => { const aEl = document.createElement('div'); aEl.className = 'reading-item alt' + (a === val ? ' user-match' : ''); aEl.innerText = a; fb.appendChild(aEl); });
-                if(!ok) { const w = document.createElement('div'); w.className='reading-item wrong'; w.innerText = val; fb.appendChild(w); }
-                const r = await fetch(`/api/report/{{rank}}`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({kanji: cur.kanji, correct: ok})});
-                upd((await r.json()).new_stats); setTimeout(next, ok ? 800 : 3000);
+                if (val === "" || isProcessing || !currentWord) return;
+                
+                isProcessing = true;
+                const isPrimary = val === currentWord.bank_reading;
+                const isAlt = currentWord.alt_readings.includes(val);
+                const isCorrect = isPrimary || isAlt;
+
+                // Copy to clipboard for convenience
+                navigator.clipboard.writeText(currentWord.kanji);
+
+                // UI Feedback
+                const fb = document.getElementById('fb');
+                fb.innerHTML = '';
+                
+                const bEl = document.createElement('div');
+                bEl.className = 'reading-item primary' + (isPrimary ? ' user-match' : '');
+                bEl.innerText = currentWord.bank_reading;
+                fb.appendChild(bEl);
+
+                currentWord.alt_readings.forEach(a => {
+                    const aEl = document.createElement('div');
+                    aEl.className = 'reading-item alt' + (a === val ? ' user-match' : '');
+                    aEl.innerText = a;
+                    fb.appendChild(aEl);
+                });
+
+                if (!isCorrect) {
+                    const w = document.createElement('div');
+                    w.className = 'reading-item wrong';
+                    w.innerText = val;
+                    fb.appendChild(w);
+                }
+
+                // Send report in background (don't await it for the UI transition)
+                fetch(`/api/report/{{rank}}`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({kanji: currentWord.kanji, correct: isCorrect})
+                }).then(r => r.json()).then(data => updateStats(data.new_stats));
+
+                // Short delay for the user to see the answer, then cycle to the preloaded word
+                setTimeout(cycleWord, isCorrect ? 600 : 2500);
             }
         });
-        upd({{stats|tojson}}); next();
+
+        // Initialize
+        updateStats({{stats|tojson}});
+        cycleWord();
     </script>
 </body>
 </html>
